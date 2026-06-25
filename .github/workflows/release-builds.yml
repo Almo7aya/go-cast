@@ -1,0 +1,161 @@
+name: Release builds
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      upload_to_release:
+        description: Upload build artifacts to the current release when run from a release ref
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  build-linux:
+    name: Build ${{ matrix.app.name }} for ${{ matrix.goos }}/${{ matrix.goarch }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        app:
+          - name: sender
+            package: ./cmd/sender
+          - name: receiver
+            package: ./cmd/receiver
+          - name: discovery
+            package: ./cmd/discovery
+        include:
+          - goos: linux
+            goarch: amd64
+            runner: ubuntu-24.04
+            artifact_suffix: linux-x86_64
+          - goos: linux
+            goarch: arm64
+            runner: ubuntu-24.04-arm
+            artifact_suffix: linux-arm64
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            pkg-config \
+            libvpx-dev \
+            libgl1-mesa-dev \
+            libx11-dev \
+            libxcursor-dev \
+            libxinerama-dev \
+            libxi-dev \
+            libxrandr-dev \
+            libxxf86vm-dev
+
+      - name: Build ${{ matrix.app.name }}
+        env:
+          CGO_ENABLED: '1'
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: |
+          mkdir -p dist
+          go build -trimpath -ldflags='-s -w' -o "dist/${{ matrix.app.name }}-${{ matrix.artifact_suffix }}" "${{ matrix.app.package }}"
+
+      - name: Package ${{ matrix.app.name }}
+        run: |
+          tar -C dist -czf "dist/${{ matrix.app.name }}-${{ matrix.artifact_suffix }}.tar.gz" "${{ matrix.app.name }}-${{ matrix.artifact_suffix }}"
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.app.name }}-${{ matrix.artifact_suffix }}
+          path: dist/${{ matrix.app.name }}-${{ matrix.artifact_suffix }}.tar.gz
+          if-no-files-found: error
+
+      - name: Upload release asset
+        if: github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.upload_to_release && startsWith(github.ref, 'refs/tags/'))
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/${{ matrix.app.name }}-${{ matrix.artifact_suffix }}.tar.gz
+
+  build-windows:
+    name: Build ${{ matrix.app.name }} for windows/amd64
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        app:
+          - name: sender
+            package: ./cmd/sender
+          - name: receiver
+            package: ./cmd/receiver
+          - name: discovery
+            package: ./cmd/discovery
+
+    defaults:
+      run:
+        shell: msys2 {0}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up MSYS2 build dependencies
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: >-
+            git
+            mingw-w64-ucrt-x86_64-go
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-pkgconf
+            mingw-w64-ucrt-x86_64-libvpx
+
+      - name: Build ${{ matrix.app.name }}
+        env:
+          CGO_ENABLED: '1'
+          GOOS: windows
+          GOARCH: amd64
+        run: |
+          package_dir="dist/${{ matrix.app.name }}-windows-x86_64"
+          mkdir -p "$package_dir"
+          go build -trimpath -ldflags='-s -w' -o "$package_dir/${{ matrix.app.name }}-windows-x86_64.exe" "${{ matrix.app.package }}"
+
+      - name: Copy Windows runtime DLLs
+        run: |
+          package_dir="dist/${{ matrix.app.name }}-windows-x86_64"
+          exe="$package_dir/${{ matrix.app.name }}-windows-x86_64.exe"
+
+          ldd "$exe" | awk '{ print $3 }' | grep '^/ucrt64/' | while read -r dll; do
+            cp -v "$dll" "$package_dir/"
+          done
+
+          cp -v /ucrt64/bin/libvpx-*.dll "$package_dir/"
+
+      - name: Package ${{ matrix.app.name }}
+        run: |
+          powershell.exe -NoProfile -Command "Compress-Archive -Path 'dist/${{ matrix.app.name }}-windows-x86_64' -DestinationPath 'dist/${{ matrix.app.name }}-windows-x86_64.zip' -Force"
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.app.name }}-windows-x86_64
+          path: dist/${{ matrix.app.name }}-windows-x86_64.zip
+          if-no-files-found: error
+
+      - name: Upload release asset
+        if: github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.upload_to_release && startsWith(github.ref, 'refs/tags/'))
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/${{ matrix.app.name }}-windows-x86_64.zip
